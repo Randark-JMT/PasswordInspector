@@ -84,7 +84,7 @@ const isDragover = ref(false)
 
 const jobId = ref(null)
 const filename = ref('')
-const fileSize = ref(0)
+const fileSize = ref(0)      // from server job.total_bytes (set after /start responds)
 const jobStatus = ref('')
 const processedBytes = ref(0)
 const totalLines = ref(0)
@@ -130,7 +130,7 @@ async function startUpload(file) {
   jobId.value = null
   failedLines.value = []
   filename.value = file.name
-  fileSize.value = file.size
+  fileSize.value = 0          // will be set from server response
   processedBytes.value = 0
   totalLines.value = 0
   importedLines.value = 0
@@ -146,6 +146,7 @@ async function startUpload(file) {
     if (!res.ok) throw new Error(await res.text())
     const job = await res.json()
     jobId.value = job.id
+    fileSize.value = job.total_bytes   // accurate size from server
     pollTimer = setInterval(pollJob, 1000)
   } catch (e) {
     toast('上传失败: ' + e.message, 'err')
