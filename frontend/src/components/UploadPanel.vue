@@ -24,25 +24,38 @@
     </div>
 
     <!-- Job progress -->
-    <template v-if="jobId">
+    <template v-if="phase !== 'idle'">
       <div class="card">
         <h2>导入进度</h2>
         <div style="color: var(--muted); font-size: .85rem; margin-bottom: 8px">
-          {{ filename }} &nbsp; {{ fmtBytes(fileSize) }}
+          {{ filename }} &nbsp; {{ fmtBytes(localFileSize) }}
         </div>
+
+        <!-- Phase label -->
+        <div style="font-size: .78rem; color: var(--muted); margin-bottom: 4px">
+          <span v-if="phase === 'uploading'">📤 上传中…</span>
+          <span v-else-if="phase === 'processing'">⚙️ 解析处理中…</span>
+          <span v-else-if="phase === 'done'">✅ 完成</span>
+          <span v-else-if="phase === 'error'" style="color: var(--danger)">❌ 出错</span>
+        </div>
+
         <div class="progress-wrap">
-          <div class="progress-bar" :style="{ width: progressPct + '%' }"></div>
+          <div class="progress-bar" :style="{ width: displayPct + '%' }"></div>
         </div>
+
         <div class="stat-row">
           <span>状态:
-            <b>
-              <span class="badge" :class="badgeClass">{{ jobStatus }}</span>
-            </b>
+            <b><span class="badge" :class="badgeClass">{{ jobStatus || phase }}</span></b>
           </span>
-          <span>已处理: <b>{{ fmtBytes(processedBytes) }}</b></span>
-          <span>总行数: <b>{{ totalLines.toLocaleString() }}</b></span>
-          <span>已导入: <b>{{ importedLines.toLocaleString() }}</b></span>
-          <span>解析失败: <b>{{ failedLinesCount.toLocaleString() }}</b></span>
+          <template v-if="phase !== 'uploading'">
+            <span>已处理: <b>{{ fmtBytes(processedBytes) }}</b></span>
+            <span>总行数: <b>{{ totalLines.toLocaleString() }}</b></span>
+            <span>已导入: <b>{{ importedLines.toLocaleString() }}</b></span>
+            <span>解析失败: <b>{{ failedLinesCount.toLocaleString() }}</b></span>
+          </template>
+          <template v-else>
+            <span>已上传: <b>{{ fmtBytes(uploadedBytes) }} / {{ fmtBytes(localFileSize) }}</b></span>
+          </template>
         </div>
         <div v-if="errorMessage" style="color: var(--danger); font-size: .82rem; margin-top: 8px">
           {{ errorMessage }}
@@ -82,9 +95,13 @@ const toast = inject('toast')
 const fileInput = ref(null)
 const isDragover = ref(false)
 
+// phase: 'idle' | 'uploading' | 'processing' | 'done' | 'error'
+const phase = ref('idle')
 const jobId = ref(null)
 const filename = ref('')
-const fileSize = ref(0)      // from server job.total_bytes (set after /start responds)
+const localFileSize = ref(0)   // browser-side File.size for upload phase progress
+const uploadedBytes = ref(0)   // XHR upload progress
+
 const jobStatus = ref('')
 const processedBytes = ref(0)
 const totalLines = ref(0)
@@ -95,16 +112,24 @@ const failedLines = ref([])
 
 let pollTimer = null
 
-const progressPct = computed(() => {
-  if (!fileSize.value) return 0
-  return Math.min(100, (processedBytes.value / fileSize.value) * 100).toFixed(1)
+// Progress percentage:
+// - uploading phase: uploadedBytes / localFileSize
+// - processing phase: processedBytes / job.total_bytes (from server)
+const serverTotalBytes = ref(0)
+const displayPct = computed(() => {
+  if (phase.value === 'uploading') {
+    if (!localFileSize.value) return 0
+    return Math.min(100, (uploadedBytes.value / localFileSize.value) * 100).toFixed(1)
+  }
+  if (!serverTotalBytes.value) return 0
+  return Math.min(100, (processedBytes.value / serverTotalBytes.value) * 100).toFixed(1)
 })
 
 const badgeClass = computed(() => ({
-  'badge-ok': jobStatus.value === 'done',
-  'badge-err': jobStatus.value === 'error',
-  'badge-processing': jobStatus.value === 'processing',
-  'badge-pending': jobStatus.value === 'pending',
+  'badge-ok': phase.value === 'done',
+  'badge-err': phase.value === 'error',
+  'badge-processing': phase.value === 'processing',
+  'badge-pending': phase.value === 'uploading',
 }))
 
 function fmtBytes(b) {
@@ -125,32 +150,61 @@ function onDrop(e) {
   if (f) startUpload(f)
 }
 
-async function startUpload(file) {
+function startUpload(file) {
   clearInterval(pollTimer)
   jobId.value = null
   failedLines.value = []
   filename.value = file.name
-  fileSize.value = 0          // will be set from server response
+  localFileSize.value = file.size
+  uploadedBytes.value = 0
   processedBytes.value = 0
+  serverTotalBytes.value = 0
   totalLines.value = 0
   importedLines.value = 0
   failedLinesCount.value = 0
   errorMessage.value = ''
-  jobStatus.value = 'pending'
+  jobStatus.value = ''
+  phase.value = 'uploading'
 
   const fd = new FormData()
   fd.append('file', file)
 
-  try {
-    const res = await fetch('/api/upload/start', { method: 'POST', body: fd })
-    if (!res.ok) throw new Error(await res.text())
-    const job = await res.json()
-    jobId.value = job.id
-    fileSize.value = job.total_bytes   // accurate size from server
-    pollTimer = setInterval(pollJob, 1000)
-  } catch (e) {
-    toast('上传失败: ' + e.message, 'err')
-  }
+  const xhr = new XMLHttpRequest()
+
+  // Upload progress (browser → server)
+  xhr.upload.addEventListener('progress', (e) => {
+    if (e.lengthComputable) uploadedBytes.value = e.loaded
+  })
+
+  xhr.addEventListener('load', () => {
+    if (xhr.status >= 200 && xhr.status < 300) {
+      try {
+        const job = JSON.parse(xhr.responseText)
+        jobId.value = job.id
+        serverTotalBytes.value = job.total_bytes
+        phase.value = 'processing'
+        jobStatus.value = job.status
+        pollTimer = setInterval(pollJob, 1000)
+      } catch {
+        phase.value = 'error'
+        errorMessage.value = '响应解析失败'
+        toast('上传失败', 'err')
+      }
+    } else {
+      phase.value = 'error'
+      errorMessage.value = xhr.responseText
+      toast('上传失败: ' + xhr.status, 'err')
+    }
+  })
+
+  xhr.addEventListener('error', () => {
+    phase.value = 'error'
+    errorMessage.value = '网络错误'
+    toast('上传失败：网络错误', 'err')
+  })
+
+  xhr.open('POST', '/api/upload/start')
+  xhr.send(fd)
 }
 
 async function pollJob() {
@@ -158,6 +212,7 @@ async function pollJob() {
     const res = await fetch(`/api/upload/job/${jobId.value}`)
     const job = await res.json()
     processedBytes.value = job.processed_bytes
+    serverTotalBytes.value = job.total_bytes
     totalLines.value = job.total_lines
     importedLines.value = job.imported_lines
     failedLinesCount.value = job.failed_lines
@@ -166,6 +221,7 @@ async function pollJob() {
 
     if (job.status === 'done' || job.status === 'error') {
       clearInterval(pollTimer)
+      phase.value = job.status
       if (job.failed_lines > 0) await loadFailedLines()
       toast(
         job.status === 'done'
