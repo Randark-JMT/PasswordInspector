@@ -7,6 +7,15 @@ import os
 from .database import init_db
 from .routers import upload, query
 
+# Starlette 0.41.3 enforces file size via class-level attributes on MultiPartParser
+# (not __init__ params). Default is 1 MB — override to unlimited for large dump files.
+try:
+    from starlette.formparsers import MultiPartParser as _MMP
+    _MMP.max_file_size = float('inf')
+    _MMP.max_part_size = float('inf')
+except Exception:
+    pass
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

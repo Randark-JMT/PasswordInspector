@@ -1,7 +1,8 @@
 import asyncio
+import os
+import tempfile
 import uuid
 from datetime import datetime, timezone
-from typing import AsyncIterator
 
 import aiofiles
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -26,23 +27,39 @@ async def start_upload(
     db: AsyncSession = Depends(get_db),
 ):
     job_id = str(uuid.uuid4())
+    filename = file.filename or "unknown"
+
+    # Stream the uploaded file to a temp file BEFORE returning the response.
+    # FastAPI closes UploadFile after the response is sent, so the background
+    # task must not hold a reference to the original UploadFile object.
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix="pi_upload_")
+    os.close(tmp_fd)
+    total_bytes = 0
+    async with aiofiles.open(tmp_path, "wb") as tmp:
+        while True:
+            chunk = await file.read(CHUNK)
+            if not chunk:
+                break
+            await tmp.write(chunk)
+            total_bytes += len(chunk)
+
     job = UploadJob(
         id=job_id,
-        filename=file.filename or "unknown",
+        filename=filename,
         status="processing",
-        total_bytes=0,
+        total_bytes=total_bytes,
         processed_bytes=0,
     )
     db.add(job)
     await db.commit()
 
-    # Fire-and-forget background task
-    asyncio.create_task(_process_upload(job_id, file, file.filename or "unknown"))
+    # Fire-and-forget: process from temp file so UploadFile lifetime doesn't matter
+    asyncio.create_task(_process_upload(job_id, tmp_path, filename, total_bytes))
 
     return UploadJobOut.model_validate(job)
 
 
-async def _process_upload(job_id: str, file: UploadFile, filename: str):
+async def _process_upload(job_id: str, tmp_path: str, filename: str, total_bytes: int):
     from ..database import AsyncSessionLocal
 
     leftover = b""
@@ -67,58 +84,59 @@ async def _process_upload(job_id: str, file: UploadFile, filename: str):
 
     try:
         async with AsyncSessionLocal() as session:
-            while True:
-                chunk = await file.read(CHUNK)
-                if not chunk:
-                    break
-                processed_bytes += len(chunk)
+            async with aiofiles.open(tmp_path, "rb") as fp:
+                while True:
+                    chunk = await fp.read(CHUNK)
+                    if not chunk:
+                        break
+                    processed_bytes += len(chunk)
 
-                raw = leftover + chunk
-                lines = raw.split(b"\n")
-                leftover = lines[-1]
+                    raw = leftover + chunk
+                    lines = raw.split(b"\n")
+                    leftover = lines[-1]
 
-                for raw_line in lines[:-1]:
-                    total_lines += 1
-                    try:
-                        line = raw_line.decode("utf-8", errors="replace")
-                        record = parse_line(line)
-                        if record is None:
-                            continue
-                        cred_buf.append(
-                            Credential(
-                                url=record["url"],
-                                domain=record["domain"],
-                                username=record["username"],
-                                password=record["password"],
-                                source_file=filename,
-                                first_seen=datetime.now(timezone.utc),
+                    for raw_line in lines[:-1]:
+                        total_lines += 1
+                        try:
+                            line = raw_line.decode("utf-8", errors="replace")
+                            record = parse_line(line)
+                            if record is None:
+                                continue
+                            cred_buf.append(
+                                Credential(
+                                    url=record["url"],
+                                    domain=record["domain"],
+                                    username=record["username"],
+                                    password=record["password"],
+                                    source_file=filename,
+                                    first_seen=datetime.now(timezone.utc),
+                                )
                             )
-                        )
-                    except ValueError as exc:
-                        fail_buf.append(
-                            FailedLine(
-                                raw=str(exc),
-                                upload_id=job_id,
-                                source_file=filename,
-                                created_at=datetime.now(timezone.utc),
+                        except ValueError as exc:
+                            fail_buf.append(
+                                FailedLine(
+                                    raw=str(exc),
+                                    upload_id=job_id,
+                                    source_file=filename,
+                                    created_at=datetime.now(timezone.utc),
+                                )
                             )
+
+                        if len(cred_buf) + len(fail_buf) >= DB_BATCH:
+                            await flush(session)
+
+                    # progress tick
+                    await session.execute(
+                        update(UploadJob)
+                        .where(UploadJob.id == job_id)
+                        .values(
+                            processed_bytes=processed_bytes,
+                            total_lines=total_lines,
+                            imported_lines=imported,
+                            failed_lines=failed,
                         )
-
-                    if len(cred_buf) + len(fail_buf) >= DB_BATCH:
-                        await flush(session)
-
-                # progress tick
-                await session.execute(
-                    update(UploadJob)
-                    .where(UploadJob.id == job_id)
-                    .values(
-                        processed_bytes=processed_bytes,
-                        total_lines=total_lines,
-                        imported_lines=imported,
-                        failed_lines=failed,
                     )
-                )
-                await session.commit()
+                    await session.commit()
 
             # handle last partial line
             if leftover:
@@ -154,7 +172,7 @@ async def _process_upload(job_id: str, file: UploadFile, filename: str):
                 .where(UploadJob.id == job_id)
                 .values(
                     status="done",
-                    total_bytes=processed_bytes,
+                    total_bytes=total_bytes,
                     processed_bytes=processed_bytes,
                     total_lines=total_lines,
                     imported_lines=imported,
@@ -172,6 +190,12 @@ async def _process_upload(job_id: str, file: UploadFile, filename: str):
                 .values(status="error", error_message=str(exc))
             )
             await session.commit()
+    finally:
+        # Always clean up the temp file
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 @router.get("/job/{job_id}", response_model=UploadJobOut)
